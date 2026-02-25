@@ -1,0 +1,14 @@
+torch
+numpy
+opencv-python
+pandas 
+matplotlib
+ultralytics
+ipykernel
+easyocr
+streamlit
+easyocr
+streamlit-webrtc
+av
+certifi
+pyserial
