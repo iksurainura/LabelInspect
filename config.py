@@ -1,51 +1,60 @@
-"""LabelInspect — Configuration"""
+"""
+LabelInspect — Configuration
+Arduino protocol: single char  'O' = OK,  'D' = DEFECT,  'R' = Reset
+"""
 
-# Model
+# ── Model ────────────────────────────────────────────────────
 MODEL_PATH  = "yolo11m-seg.pt"
-DEVICE      = "cuda"
+DEVICE      = "cuda"            # "cuda" | "cpu"
 IMG_SIZE    = 640
 
-# Detection
+# ── Detection ────────────────────────────────────────────────
 DEFAULT_CONF_THRESHOLD = 0.25
 DEFAULT_IOU_THRESHOLD  = 0.45
-CONFIRMATION_TIME      = 2.0
+CONFIRMATION_TIME      = 2.0    # seconds stable before state commits
 FPS_TARGET             = 15
 
-# Video
+# ── Video ────────────────────────────────────────────────────
 VIDEO_WIDTH   = 960
 VIDEO_HEIGHT  = 540
 CAMERA_INDEX  = 1
 
-# Serial
-SERIAL_PORT     = "/dev/ttyACM0"
+# ── Serial / Arduino ─────────────────────────────────────────
+SERIAL_PORT     = "/dev/ttyACM0"    # Windows: "COM3"
 SERIAL_BAUDRATE = 9600
 SERIAL_TIMEOUT  = 1
 
-# Servo commands
-SERVO_DEFECT_CMD = "L"
-SERVO_OK_CMD     = "C"
-SERVO_IDLE_CMD   = "I"
+# ── Arduino Commands (single char) ───────────────────────────
+# 'O' → labelType=1 → arms irOK  (pin 2) → sweeps servoOK  (pin 9)
+# 'D' → labelType=0 → arms irDEFECT (pin 3) → sweeps servoDEFECT (pin 10)
+# 'R' → reset: conveyor ON, clears labelType
+CMD_OK     = "O"
+CMD_DEFECT = "D"
+CMD_RESET  = "R"
 
-# IR gate trigger char (Arduino sends this when belt tag detected)
-IR_TRIGGER_CHAR = "T"
-
-# Classes
+# ── Classes ──────────────────────────────────────────────────
 CLASS_NAMES    = {0: "Defect", 1: "No Defect"}
 DEFECT_CLASSES = [0]
 
+# ── Palette  (ALL keys used in app.py live here) ─────────────
 THEME = {
-    "bg_void":       "#060a10",
-    "bg_deep":       "#0d1117",
-    "bg_panel":      "#111720",
-    "bg_card":       "#161d28",
-    "bg_raised":     "#1c2433",
-    "border_dim":    "#1e2d40",
-    "border_mid":    "#2a3f58",
-    "border_bright": "#3d5a7a",
-    "text_white":    "#f0f6fc",
-    "text_primary":  "#cdd9e5",
-    "text_secondary":"#768390",
-    "text_muted":    "#444c56",
+    # backgrounds
+    "void":          "#060a10",
+    "deep":          "#0d1117",
+    "panel":         "#0f1621",
+    "card":          "#131a24",
+    "raised":        "#18212e",
+    "hover":         "#1d2a3a",
+    # borders
+    "b_dim":         "#1a2840",
+    "b_mid":         "#243650",
+    "b_bright":      "#2e4a6e",
+    # text
+    "white":         "#f0f6fc",
+    "t_primary":     "#cdd9e5",
+    "t_secondary":   "#6b7d8f",
+    "t_muted":       "#394655",
+    # accents
     "blue":          "#4da6ff",
     "blue_dim":      "#1f78d1",
     "cyan":          "#39d0d8",

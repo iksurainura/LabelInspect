@@ -1,6 +1,8 @@
 """
 LabelInspect — Real-Time Defect Detection
 Full-page layout, no sidebar.
+Arduino protocol: single char  'O' = OK label, 'D' = DEFECT label, 'R' = Reset
+Two IR sensors + two servos + conveyor relay.
 """
 
 import streamlit as st
@@ -33,6 +35,7 @@ with open("styles.css", encoding="utf-8") as _f:
 # ================================================================
 def init():
     defaults = {
+        # detection runtime
         "running":           False,
         "conf":              config.DEFAULT_CONF_THRESHOLD,
         "iou":               config.DEFAULT_IOU_THRESHOLD,
@@ -41,31 +44,31 @@ def init():
         "fps_target":        config.FPS_TARGET,
         "video_width":       config.VIDEO_WIDTH,
         "video_height":      config.VIDEO_HEIGHT,
+        # state machine
         "confirmed_output":  "IDLE",
         "pending_output":    None,
         "pending_since":     None,
+        "last_sent_cmd":     None,
+        # history
         "output_history":    deque(maxlen=100),
+        "stats":             {"defect": 0, "no_defect": 0, "idle": 0, "total": 0},
+        "frame_count":       0,
+        # serial
         "ser":               None,
         "connected":         False,
-        "last_cmd":          None,
-        "last_response":     None,
-        "servo_pos":         90,
-        "ir_triggered":      False,
-        "pending_servo_cmd": None,
-        "frame_count":       0,
-        "stats":             {"defect": 0, "no_defect": 0, "idle": 0, "total": 0},
-        # settings panel state
-        "camera_index_tmp":  config.CAMERA_INDEX,
-        "fps_tmp":           config.FPS_TARGET,
-        "vw_tmp":            config.VIDEO_WIDTH,
-        "vh_tmp":            config.VIDEO_HEIGHT,
-        "model_path_tmp":    config.MODEL_PATH,
-        "device_tmp":        config.DEVICE,
-        "conf_tmp":          config.DEFAULT_CONF_THRESHOLD,
-        "iou_tmp":           config.DEFAULT_IOU_THRESHOLD,
-        "confirm_tmp":       config.CONFIRMATION_TIME,
-        "serial_port_tmp":   config.SERIAL_PORT,
-        "baud_tmp":          9600,
+        "last_tx":           None,
+        "last_rx":           None,
+        # hardware state (live, updated from Arduino serial responses)
+        "conveyor_on":       False,
+        "ir_ok_triggered":   False,
+        "ir_def_triggered":  False,
+        "servo_ok_active":   False,
+        "servo_def_active":  False,
+        # settings (editable via tabs)
+        "model_path":        config.MODEL_PATH,
+        "device":            config.DEVICE,
+        "serial_port":       config.SERIAL_PORT,
+        "baud":              config.SERIAL_BAUDRATE,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -74,7 +77,7 @@ def init():
 init()
 
 # ================================================================
-# ARDUINO
+# SERIAL / ARDUINO
 # ================================================================
 def connect_arduino(port, baud):
     try:
@@ -84,10 +87,10 @@ def connect_arduino(port, baud):
         time.sleep(2.5)
         st.session_state.ser       = ser
         st.session_state.connected = True
-        st.session_state.last_response = f"OK  {port} @ {baud}"
+        st.session_state.last_rx   = "Connected"
         return True
     except Exception as e:
-        st.session_state.last_response = f"ERR  {e}"
+        st.session_state.last_rx = f"ERR: {e}"
         return False
 
 def disconnect_arduino():
@@ -95,77 +98,128 @@ def disconnect_arduino():
         st.session_state.ser.close()
     st.session_state.ser       = None
     st.session_state.connected = False
-    st.session_state.last_response = "Disconnected"
+    st.session_state.last_rx   = "Disconnected"
 
-def send_servo(cmd):
+def send_cmd(char):
+    """Send a single character command to Arduino."""
     if not st.session_state.ser or not st.session_state.ser.is_open:
-        st.session_state.last_response = "Not connected"
+        st.session_state.last_rx = "Not connected"
         return False
     try:
-        st.session_state.ser.write(cmd.encode())
+        st.session_state.ser.write(char.encode())
         st.session_state.ser.flush()
         ts = datetime.now().strftime("%H:%M:%S")
-        st.session_state.last_cmd = f"{ts}  TX  {cmd}"
-        if cmd == "L":   st.session_state.servo_pos = 0
-        elif cmd == "C": st.session_state.servo_pos = 90
-        elif cmd == "R": st.session_state.servo_pos = 180
-        time.sleep(0.05)
-        if st.session_state.ser.in_waiting:
-            r = st.session_state.ser.readline().decode("utf-8", errors="ignore").strip()
-            if r: st.session_state.last_response = r
+        st.session_state.last_tx       = f"{ts}  ->  '{char}'"
+        st.session_state.last_sent_cmd = char
         return True
     except Exception as e:
-        st.session_state.last_response = f"TX FAIL  {e}"
+        st.session_state.last_rx = f"TX FAIL: {e}"
         return False
 
-def poll_ir():
+def poll_serial():
+    """
+    Non-blocking read of all pending Arduino responses.
+    Parses known ACK strings and updates hardware state flags.
+    """
     if not st.session_state.ser or not st.session_state.ser.is_open:
-        return False
+        return
     try:
         while st.session_state.ser.in_waiting:
-            ch = st.session_state.ser.read(1).decode("utf-8", errors="ignore")
-            if ch == config.IR_TRIGGER_CHAR:
-                st.session_state.ir_triggered = True
-                if st.session_state.pending_servo_cmd:
-                    send_servo(st.session_state.pending_servo_cmd)
-                    st.session_state.pending_servo_cmd = None
-                return True
+            raw = st.session_state.ser.readline().decode("utf-8", errors="ignore").strip()
+            if not raw:
+                continue
+            st.session_state.last_rx = raw
+
+            if raw == "READY":
+                st.session_state.conveyor_on = True
+
+            elif raw == "ACK:OK":
+                # Arduino received 'O' — conveyor stopping, waiting for IR-OK
+                st.session_state.conveyor_on      = False
+                st.session_state.ir_ok_triggered  = False
+                st.session_state.servo_ok_active  = False
+
+            elif raw == "ACK:DEFECT":
+                # Arduino received 'D' — conveyor stopping, waiting for IR-DEFECT
+                st.session_state.conveyor_on      = False
+                st.session_state.ir_def_triggered = False
+                st.session_state.servo_def_active = False
+
+            elif raw == "ACK:RESET":
+                st.session_state.conveyor_on      = True
+                st.session_state.ir_ok_triggered  = False
+                st.session_state.ir_def_triggered = False
+                st.session_state.servo_ok_active  = False
+                st.session_state.servo_def_active = False
+
+            elif raw == "IR:OK":
+                # IR-OK sensor triggered — servoOK sweeping
+                st.session_state.ir_ok_triggered  = True
+                st.session_state.servo_ok_active  = True
+
+            elif raw == "IR:DEFECT":
+                # IR-DEFECT sensor triggered — servoDEFECT sweeping
+                st.session_state.ir_def_triggered = True
+                st.session_state.servo_def_active = True
+
     except Exception:
         pass
-    return False
 
 def list_ports():
     return [p.device for p in serial.tools.list_ports.comports()]
 
 # ================================================================
-# DETECTION LOGIC
+# DETECTION / CONFIRMATION STATE MACHINE
 # ================================================================
-def confirm(detections):
-    now      = time.time()
-    ct       = st.session_state.confirm_time
+def check_confirm(detections):
+    """
+    Returns: confirmed_state, is_new_confirmation, info_dict, progress_0_to_1
+    When a state is stable for confirm_time seconds:
+      - DEFECT   -> sends 'D' to Arduino
+      - NO_DEFECT -> sends 'O' to Arduino
+      - IDLE     -> no command
+    """
+    now = time.time()
+    ct  = st.session_state.confirm_time
 
     if not detections:
         cur  = "IDLE"
-        info = {"label":"NO DETECTION","badge":"pill-muted","cmd":None,
-                "angle":90,"color":config.THEME["text_muted"],"cls":"sc-idle"}
+        info = {
+            "label": "NO DETECTION",
+            "badge": "pill-muted",
+            "cmd":   None,
+            "color": config.THEME["t_muted"],
+            "cls":   "sc-idle",
+        }
     elif any(d["class_id"] in config.DEFECT_CLASSES for d in detections):
         cur  = "DEFECT"
-        info = {"label":"DEFECT DETECTED","badge":"pill-red","cmd":config.SERVO_DEFECT_CMD,
-                "angle":0,"color":config.THEME["red"],"cls":"sc-defect"}
+        info = {
+            "label": "DEFECT DETECTED",
+            "badge": "pill-red",
+            "cmd":   config.CMD_DEFECT,
+            "color": config.THEME["red"],
+            "cls":   "sc-defect",
+        }
     else:
         cur  = "NO_DEFECT"
-        info = {"label":"NO DEFECT","badge":"pill-green","cmd":config.SERVO_OK_CMD,
-                "angle":90,"color":config.THEME["green"],"cls":"sc-ok"}
+        info = {
+            "label": "NO DEFECT",
+            "badge": "pill-green",
+            "cmd":   config.CMD_OK,
+            "color": config.THEME["green"],
+            "cls":   "sc-ok",
+        }
 
     is_new = False
     prog   = 0.0
+
     if st.session_state.pending_output == cur:
         elapsed = now - (st.session_state.pending_since or now)
         prog    = min(elapsed / ct, 1.0)
         if elapsed >= ct and st.session_state.confirmed_output != cur:
             st.session_state.confirmed_output = cur
             if info["cmd"]:
-                st.session_state.pending_servo_cmd = info["cmd"]
+                send_cmd(info["cmd"])
             is_new = True
     else:
         st.session_state.pending_output = cur
@@ -174,7 +228,7 @@ def confirm(detections):
     return st.session_state.confirmed_output, is_new, info, prog
 
 # ================================================================
-# MODEL
+# MODEL LOADER
 # ================================================================
 @st.cache_resource
 def load_model(path, dev):
@@ -190,39 +244,131 @@ def load_model(path, dev):
 # HTML HELPERS
 # ================================================================
 def sh(label):
-    return f'<div class="sh"><span class="sh-text">{label}</span><div class="sh-line"></div></div>'
+    """Section header with label + extending rule line."""
+    return (
+        f'<div class="sh">'
+        f'<span class="sh-text">{label}</span>'
+        f'<div class="sh-line"></div>'
+        f'</div>'
+    )
 
-def pill(text, cls="pill-muted", dot=False, pulse=False):
-    d = f'<span class="dot{"dot-pulse" if pulse else ""}"></span>' if dot else ""
+def pill(text, cls="pill-muted", dot=True, pulse=False):
+    d = f'<span class="dot{" dot-pulse" if pulse else ""}"></span>' if dot else ""
     return f'<span class="pill {cls}">{d}{text}</span>'
 
-def logline(key, val):
-    return f'<div class="logline"><span class="lkey">{key}</span><span class="lval">{val}</span></div>'
+def logline(k, v):
+    return (
+        f'<div class="logline">'
+        f'<span class="lk">{k}</span>'
+        f'<span class="lv">{v}</span>'
+        f'</div>'
+    )
+
+def hw_row(label, led_cls, val_text, val_color="var(--t-pri)"):
+    return (
+        f'<div class="hw-row">'
+        f'<span class="hw-row-label">'
+        f'<span class="hw-led {led_cls}"></span>{label}</span>'
+        f'<span class="hw-val" style="color:{val_color};">{val_text}</span>'
+        f'</div>'
+    )
 
 # ================================================================
-# TOPBAR
+# HARDWARE PANEL RENDERER
 # ================================================================
-run_cls  = "run"  if st.session_state.running   else "stop"
-ard_cls  = "ok"   if st.session_state.connected else "err"
-ir_cls   = "warn" if st.session_state.ir_triggered else "stop"
+def render_hw():
+    conv_on  = st.session_state.conveyor_on
+    ir_ok    = st.session_state.ir_ok_triggered
+    ir_def   = st.session_state.ir_def_triggered
+    sv_ok    = st.session_state.servo_ok_active
+    sv_def   = st.session_state.servo_def_active
 
-status_txt = "RUNNING"    if st.session_state.running   else "STOPPED"
-ard_txt    = "ARDUINO OK" if st.session_state.connected else "NO ARDUINO"
-ir_txt     = "IR ACTIVE"  if st.session_state.ir_triggered else "IR IDLE"
+    T = config.THEME
+
+    conv_led = "on-green" if conv_on  else "on-orange blink"
+    conv_txt = "RUNNING"  if conv_on  else "STOPPED"
+    conv_col = T["green"] if conv_on  else T["orange"]
+
+    ir2_led  = "on-green blink" if ir_ok  else "off"
+    ir2_txt  = "TRIGGERED"      if ir_ok  else "WAITING"
+    ir2_col  = T["green"]       if ir_ok  else T["t_secondary"]
+
+    ir1_led  = "on-red blink"   if ir_def else "off"
+    ir1_txt  = "TRIGGERED"      if ir_def else "WAITING"
+    ir1_col  = T["red"]         if ir_def else T["t_secondary"]
+
+    sv2_led  = "on-green blink" if sv_ok  else "off"
+    sv2_txt  = "SWEEPING"       if sv_ok  else "IDLE (0 deg)"
+    sv2_col  = T["green"]       if sv_ok  else T["t_secondary"]
+
+    sv1_led  = "on-red blink"   if sv_def else "off"
+    sv1_txt  = "SWEEPING"       if sv_def else "IDLE (0 deg)"
+    sv1_col  = T["red"]         if sv_def else T["t_secondary"]
+
+    hw_ph.markdown(f"""
+<div class="hw-card">
+  <div class="hw-title">Hardware Status</div>
+  {hw_row("Conveyor  (Relay Pin 8)", conv_led, conv_txt, conv_col)}
+  {hw_row("IR Sensor OK  (Pin 2)", ir2_led, ir2_txt, ir2_col)}
+  {hw_row("IR Sensor DEFECT  (Pin 3)", ir1_led, ir1_txt, ir1_col)}
+  {hw_row("Servo OK  (Pin 9)", sv2_led, sv2_txt, sv2_col)}
+  {hw_row("Servo DEFECT  (Pin 10)", sv1_led, sv1_txt, sv1_col)}
+</div>""", unsafe_allow_html=True)
+
+# ================================================================
+# STATS RENDERER
+# ================================================================
+def render_stats():
+    s = st.session_state.stats
+    stats_ph.markdown(f"""
+<div class="stats-grid">
+  <div class="sg-cell sg-total">
+    <div class="sg-val">{s['total']}</div>
+    <div class="sg-lbl">Total</div>
+  </div>
+  <div class="sg-cell sg-defect">
+    <div class="sg-val">{s['defect']}</div>
+    <div class="sg-lbl">Defect</div>
+  </div>
+  <div class="sg-cell sg-good">
+    <div class="sg-val">{s['no_defect']}</div>
+    <div class="sg-lbl">Good</div>
+  </div>
+  <div class="sg-cell sg-idle">
+    <div class="sg-val">{s['idle']}</div>
+    <div class="sg-lbl">Idle</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+# ================================================================
+# TOP BAR
+# ================================================================
+run_cls = "run"  if st.session_state.running    else "stop"
+ard_cls = "ok"   if st.session_state.connected  else "err"
+con_cls = "ok"   if st.session_state.conveyor_on else "warn"
 
 st.markdown(f"""
 <div class="topbar">
   <div class="tb-brand">
-    <div class="tb-logo">🔍</div>
+    <div class="tb-logo">&#128269;</div>
     <div>
       <div class="tb-name">LabelInspect</div>
-      <div class="tb-sub">AI Visual Inspection &nbsp;·&nbsp; YOLO &nbsp;·&nbsp; Arduino Servo + IR Gate</div>
+      <div class="tb-sub">
+        AI Visual Inspection &nbsp;·&nbsp; YOLO &nbsp;·&nbsp;
+        Dual Servo + Dual IR &nbsp;·&nbsp; Conveyor Control
+      </div>
     </div>
   </div>
   <div class="tb-right">
-    {pill(status_txt, "pill-green" if st.session_state.running else "pill-muted", dot=True, pulse=st.session_state.running)}
-    {pill(ard_txt,    "pill-green" if st.session_state.connected else "pill-red", dot=True)}
-    {pill(ir_txt,     "pill-orange" if st.session_state.ir_triggered else "pill-muted", dot=True)}
+    {pill("RUNNING" if st.session_state.running else "STOPPED",
+          "pill-green" if st.session_state.running else "pill-muted",
+          dot=True, pulse=st.session_state.running)}
+    {pill("ARDUINO" if st.session_state.connected else "NO ARDUINO",
+          "pill-green" if st.session_state.connected else "pill-red",
+          dot=True)}
+    {pill("CONVEYOR ON" if st.session_state.conveyor_on else "CONVEYOR OFF",
+          "pill-blue" if st.session_state.conveyor_on else "pill-orange",
+          dot=True)}
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -230,27 +376,32 @@ st.markdown(f"""
 # ================================================================
 # CONTROLS ROW
 # ================================================================
-cc1, cc2, cc3 = st.columns([1, 1, 6])
+cc1, cc2, cc3, _sp = st.columns([1, 1, 1, 5])
 with cc1:
-    if st.button("▶  START DETECTION", use_container_width=True, type="primary",
+    if st.button("START", use_container_width=True, type="primary",
                  disabled=st.session_state.running):
-        st.session_state.running      = True
-        st.session_state.ir_triggered = False
+        st.session_state.running     = True
+        st.session_state.conveyor_on = True
         st.rerun()
 with cc2:
-    if st.button("⏹  STOP DETECTION", use_container_width=True,
+    if st.button("STOP", use_container_width=True,
                  disabled=not st.session_state.running):
         st.session_state.running = False
         st.rerun()
+with cc3:
+    if st.button("RESET", use_container_width=True,
+                 disabled=not st.session_state.connected,
+                 help="Send 'R' to Arduino: restarts conveyor, clears label state"):
+        send_cmd(config.CMD_RESET)
+        st.toast("Reset sent to Arduino", icon="&#8635;")
+        st.rerun()
 
-st.markdown("<div style='margin-bottom:18px;'></div>", unsafe_allow_html=True)
+st.markdown("<div style='margin-bottom:16px;'></div>", unsafe_allow_html=True)
 
 # ================================================================
-# MAIN ROW — Feed | Status + Servo + IR
+# MAIN ROW  —  Feed  |  Status + Hardware + Metrics
 # ================================================================
-model_path = st.session_state.model_path_tmp
-device     = st.session_state.device_tmp
-model      = load_model(model_path, device)
+model = load_model(st.session_state.model_path, st.session_state.device)
 
 feed_col, right_col = st.columns([3, 1], gap="large")
 
@@ -261,14 +412,14 @@ with feed_col:
 with right_col:
     st.markdown(sh("Detection Status"), unsafe_allow_html=True)
     status_ph = st.empty()
-    servo_ph  = st.empty()
-    ir_ph     = st.empty()
+
+    hw_ph = st.empty()   # hardware status card (no section header, hw-card has its own title)
 
     st.markdown(sh("Metrics"), unsafe_allow_html=True)
-    m1, m2, m3 = st.columns(3)
-    with m1: fps_ph  = st.empty()
-    with m2: det_ph  = st.empty()
-    with m3: cf_ph   = st.empty()
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1: fps_ph  = st.empty()
+    with mc2: det_ph  = st.empty()
+    with mc3: cf_ph   = st.empty()
 
 # ================================================================
 # HISTORY + STATS ROW
@@ -280,343 +431,318 @@ with hist_col:
     st.markdown(sh("Detection History"), unsafe_allow_html=True)
     table_ph = st.empty()
     table_ph.dataframe(
-        pd.DataFrame(columns=["Time","Status","Confidence","Objects","Cmd","Angle"]),
+        pd.DataFrame(columns=["Time", "Status", "Confidence", "Objects", "Sent", "Action"]),
         use_container_width=True, height=220
     )
 
 with stat_col:
     st.markdown(sh("Statistics"), unsafe_allow_html=True)
     stats_ph = st.empty()
-    s = st.session_state.stats
-    stats_ph.markdown(f"""
-<div class="stats-grid">
-  <div class="sg-cell sg-total"><div class="sg-val">{s['total']}</div><div class="sg-lbl">Total</div></div>
-  <div class="sg-cell sg-defect"><div class="sg-val">{s['defect']}</div><div class="sg-lbl">Defect</div></div>
-  <div class="sg-cell sg-good"><div class="sg-val">{s['no_defect']}</div><div class="sg-lbl">Good</div></div>
-  <div class="sg-cell sg-idle"><div class="sg-val">{s['idle']}</div><div class="sg-lbl">Idle</div></div>
-</div>""", unsafe_allow_html=True)
+    render_stats()
 
 # ================================================================
-# SETTINGS PANEL — Tabbed, all inline
+# SETTINGS  —  Tabbed, all inline
 # ================================================================
 st.markdown("<div style='margin-top:6px;'></div>", unsafe_allow_html=True)
 st.markdown(sh("Settings"), unsafe_allow_html=True)
 
-tab_cam, tab_model, tab_thresh, tab_ard, tab_servo, tab_ir = st.tabs([
-    "📷  Camera",
-    "🧠  Model",
-    "🎯  Thresholds",
-    "🔌  Arduino",
-    "🎛  Servo Debug",
-    "🔴  IR Gate",
+tab_cam, tab_model, tab_thresh, tab_ard, tab_ref = st.tabs([
+    "  Camera  ",
+    "  Model  ",
+    "  Thresholds  ",
+    "  Arduino  ",
+    "  Hardware Reference  ",
 ])
 
-# ── Camera tab ────────────────────────────────────────────────
+# ── Camera ────────────────────────────────────────────────────
 with tab_cam:
-    tc1, tc2, tc3 = st.columns([1,1,2])
+    tc1, tc2, tc3 = st.columns([1, 1, 2])
     with tc1:
-        cam_idx = st.number_input("Camera Index", 0, 10,
-                                  st.session_state.camera_index_tmp,
-                                  help="0 = default, 1 = USB, etc.")
-        st.session_state.camera_index_tmp = cam_idx
-        st.session_state.camera_index     = cam_idx
+        ci = st.number_input("Camera Index", 0, 10,
+                             st.session_state.camera_index,
+                             help="0=default webcam, 1=USB camera")
+        st.session_state.camera_index = ci
     with tc2:
-        fps_v = st.slider("Target FPS", 1, 30, st.session_state.fps_tmp)
-        st.session_state.fps_tmp    = fps_v
-        st.session_state.fps_target = fps_v
+        fp = st.slider("Target FPS", 1, 30, st.session_state.fps_target)
+        st.session_state.fps_target = fp
     with tc3:
         st.markdown("**Resolution**")
-        tr1, tr2, tr3 = st.columns(3)
-        with tr1:
-            if st.button("640 x 480", use_container_width=True):
-                st.session_state.vw_tmp = 640; st.session_state.vh_tmp = 480
-                st.session_state.video_width = 640; st.session_state.video_height = 480
-        with tr2:
-            if st.button("960 x 540", use_container_width=True, type="primary"):
-                st.session_state.vw_tmp = 960; st.session_state.vh_tmp = 540
-                st.session_state.video_width = 960; st.session_state.video_height = 540
-        with tr3:
-            if st.button("1280 x 720", use_container_width=True):
-                st.session_state.vw_tmp = 1280; st.session_state.vh_tmp = 720
-                st.session_state.video_width = 1280; st.session_state.video_height = 720
+        rr1, rr2, rr3 = st.columns(3)
+        with rr1:
+            if st.button("640x480", use_container_width=True):
+                st.session_state.video_width  = 640
+                st.session_state.video_height = 480
+        with rr2:
+            if st.button("960x540", use_container_width=True, type="primary"):
+                st.session_state.video_width  = 960
+                st.session_state.video_height = 540
+        with rr3:
+            if st.button("1280x720", use_container_width=True):
+                st.session_state.video_width  = 1280
+                st.session_state.video_height = 720
         st.markdown(
-            f'<div style="margin-top:8px;">'
-            + logline("Active", f"{st.session_state.vw_tmp} x {st.session_state.vh_tmp}  @  {fps_v} fps")
-            + '</div>',
+            logline("Active",
+                    f"{st.session_state.video_width}x{st.session_state.video_height}"
+                    f"  @  {fp} fps"),
             unsafe_allow_html=True
         )
 
-# ── Model tab ─────────────────────────────────────────────────
+# ── Model ──────────────────────────────────────────────────────
 with tab_model:
     tm1, tm2 = st.columns(2)
     with tm1:
-        mp = st.text_input("Model Path", st.session_state.model_path_tmp,
+        mp = st.text_input("Model Path", st.session_state.model_path,
                            help="Relative or absolute path to .pt file")
-        st.session_state.model_path_tmp = mp
+        if mp != st.session_state.model_path:
+            st.session_state.model_path = mp
+            st.cache_resource.clear()
     with tm2:
-        dv = st.selectbox("Inference Device", ["cuda","cpu"],
-                          index=0 if st.session_state.device_tmp == "cuda" else 1,
-                          help="cuda = GPU, cpu = fallback")
-        st.session_state.device_tmp = dv
+        dv = st.selectbox("Device", ["cuda", "cpu"],
+                          index=0 if st.session_state.device == "cuda" else 1,
+                          help="cuda=GPU (fast), cpu=fallback")
+        if dv != st.session_state.device:
+            st.session_state.device = dv
+            st.cache_resource.clear()
     st.markdown(
         logline("Model", mp) + logline("Device", dv.upper()),
         unsafe_allow_html=True
     )
 
-# ── Thresholds tab ────────────────────────────────────────────
+# ── Thresholds ─────────────────────────────────────────────────
 with tab_thresh:
     tt1, tt2, tt3 = st.columns(3)
     with tt1:
-        cv = st.slider("Confidence", 0.01, 1.0, st.session_state.conf_tmp, 0.01)
-        st.session_state.conf_tmp = cv; st.session_state.conf = cv
+        cv = st.slider("Confidence", 0.01, 1.0, st.session_state.conf, 0.01,
+                       help="Minimum confidence to count a detection")
+        st.session_state.conf = cv
     with tt2:
-        iv = st.slider("IOU / NMS",  0.01, 1.0, st.session_state.iou_tmp,  0.01)
-        st.session_state.iou_tmp = iv; st.session_state.iou = iv
+        iv = st.slider("IOU / NMS", 0.01, 1.0, st.session_state.iou, 0.01,
+                       help="Overlap threshold for deduplication")
+        st.session_state.iou = iv
     with tt3:
         ctv = st.slider("Confirm Time (s)", 0.5, 5.0,
-                         st.session_state.confirm_tmp, 0.5,
-                         help="Seconds detection must stay stable before state commits")
-        st.session_state.confirm_tmp  = ctv
+                        st.session_state.confirm_time, 0.5,
+                        help="Detection must be stable this long before command is sent")
         st.session_state.confirm_time = ctv
 
-# ── Arduino tab ───────────────────────────────────────────────
+# ── Arduino ────────────────────────────────────────────────────
 with tab_ard:
     _cls = "ok" if st.session_state.connected else "no"
     _txt = "CONNECTED" if st.session_state.connected else "DISCONNECTED"
-    _pinfo = f"  {st.session_state.ser.port}" if st.session_state.connected and st.session_state.ser else ""
+    _pi  = (f"  ·  {st.session_state.ser.port}"
+            if st.session_state.connected and st.session_state.ser else "")
     st.markdown(
         f'<div class="conn-banner {_cls}">'
         f'<span class="conn-dot {"blink" if st.session_state.connected else ""}"></span>'
-        f'{_txt}{_pinfo}</div>',
+        f'{_txt}{_pi}</div>',
         unsafe_allow_html=True
     )
 
-    ta1, ta2, ta3, ta4 = st.columns([2,1,1,1])
+    ta1, ta2, ta3, ta4 = st.columns([2, 1, 1, 1])
     with ta1:
         avail = list_ports()
         if avail:
-            sp = st.selectbox("Serial Port", avail,
-                              index=avail.index(config.SERIAL_PORT) if config.SERIAL_PORT in avail else 0)
+            sp = st.selectbox(
+                "Serial Port", avail,
+                index=avail.index(st.session_state.serial_port)
+                if st.session_state.serial_port in avail else 0
+            )
         else:
-            sp = st.text_input("Serial Port", st.session_state.serial_port_tmp)
+            sp = st.text_input("Serial Port", st.session_state.serial_port)
             st.caption("No ports detected — enter manually")
-        st.session_state.serial_port_tmp = sp
+        st.session_state.serial_port = sp
     with ta2:
-        bd = st.selectbox("Baud Rate", [9600, 115200], index=0)
-        st.session_state.baud_tmp = bd
+        bd = st.selectbox("Baud Rate", [9600, 115200],
+                          index=0 if st.session_state.baud == 9600 else 1)
+        st.session_state.baud = bd
     with ta3:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Connect", use_container_width=True, type="primary"):
             if connect_arduino(sp, bd):
-                st.toast("Arduino connected", icon="🔗"); st.rerun()
+                st.toast("Arduino connected", icon="&#128279;")
+                st.rerun()
             else:
                 st.error("Connection failed")
     with ta4:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Disconnect", use_container_width=True):
-            disconnect_arduino(); st.rerun()
+            disconnect_arduino()
+            st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("**Manual Commands**")
+    mc_1, mc_2, mc_3 = st.columns(3)
+    _dis = not st.session_state.connected
+    with mc_1:
+        if st.button("Send 'O'  (OK)", use_container_width=True, disabled=_dis):
+            send_cmd(config.CMD_OK)
+            st.rerun()
+    with mc_2:
+        if st.button("Send 'D'  (DEFECT)", use_container_width=True, disabled=_dis):
+            send_cmd(config.CMD_DEFECT)
+            st.rerun()
+    with mc_3:
+        if st.button("Send 'R'  (RESET)", use_container_width=True, disabled=_dis):
+            send_cmd(config.CMD_RESET)
+            st.rerun()
 
     st.markdown(
-        logline("TX", st.session_state.last_cmd or "---") +
-        logline("RX", st.session_state.last_response or "---"),
+        logline("TX", st.session_state.last_tx or "---") +
+        logline("RX", st.session_state.last_rx or "---"),
         unsafe_allow_html=True
     )
 
-# ── Servo Debug tab ───────────────────────────────────────────
-with tab_servo:
-    pos      = st.session_state.servo_pos
-    pos_pct  = (pos / 180) * 100
-    pcol     = config.THEME["red"]   if pos == 0  else \
-               config.THEME["green"] if pos == 90 else \
-               config.THEME["blue"]
-    pname    = "LEFT" if pos == 0 else "CENTER" if pos == 90 else "RIGHT"
+# ── Hardware Reference ─────────────────────────────────────────
+with tab_ref:
+    hr1, hr2 = st.columns(2)
+    with hr1:
+        st.markdown("""
+**Arduino Pin Reference**
 
-    ts1, ts2 = st.columns([1,2])
-    with ts1:
-        st.markdown(f"""
-<div class="servo-card">
-  <div class="sv-header">
-    <span class="sv-title">Current Position</span>
-  </div>
-  <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px;">
-    <span class="sv-val" style="color:{pcol};">{pos}&deg;</span>
-    <span style="font-family:var(--mono);font-size:11px;color:var(--t-secondary);">{pname}</span>
-  </div>
-  <div class="sv-track">
-    <div class="sv-thumb" style="left:calc({pos_pct:.1f}% - 8px);background:{pcol};color:{pcol};"></div>
-  </div>
-  <div class="sv-ticks"><span>0&deg;</span><span>90&deg;</span><span>180&deg;</span></div>
-</div>
-        """, unsafe_allow_html=True)
+| Component | Pin |
+|---|---|
+| IR Sensor OK lane | 2 |
+| IR Sensor DEFECT lane | 3 |
+| Conveyor Relay | 8 |
+| Servo OK | 9 |
+| Servo DEFECT | 10 |
 
-    with ts2:
-        st.markdown("**Manual Control**")
-        _dis = not st.session_state.connected
-        sm1, sm2, sm3 = st.columns(3)
-        with sm1:
-            if st.button("LEFT  0deg",   key="sv_l", use_container_width=True, disabled=_dis):
-                send_servo("L"); st.rerun()
-        with sm2:
-            if st.button("CENTER  90deg",key="sv_c", use_container_width=True, disabled=_dis):
-                send_servo("C"); st.rerun()
-        with sm3:
-            if st.button("RIGHT  180deg",key="sv_r", use_container_width=True, disabled=_dis):
-                send_servo("R"); st.rerun()
+**Serial Protocol — single char**
 
-        st.markdown(
-            logline("TX", st.session_state.last_cmd or "---") +
-            logline("RX", st.session_state.last_response or "---"),
-            unsafe_allow_html=True
-        )
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("Run L > C > R Test Sequence", use_container_width=True, disabled=_dis):
-            with st.spinner("Testing..."):
-                for c in ("L","C","R","C"):
-                    send_servo(c); time.sleep(0.6)
-            st.toast("Sequence done", icon="✅"); st.rerun()
+| Char | Python sends when | Arduino action |
+|---|---|---|
+| `O` | NO_DEFECT confirmed 2s | Arms IR-OK, stops conveyor 4s |
+| `D` | DEFECT confirmed 2s | Arms IR-DEFECT, stops conveyor 4s |
+| `R` | Manual reset button | Conveyor ON, clears labelType |
 
-# ── IR Gate tab ───────────────────────────────────────────────
-with tab_ir:
-    ti1, ti2 = st.columns([1,2])
-    with ti1:
-        ir_on  = st.session_state.ir_triggered
-        pend   = st.session_state.pending_servo_cmd
-        ir_cls2= "ir-hot" if ir_on else ""
-        led_c  = "on" if ir_on else "off"
-        ir_col = config.THEME["orange"] if ir_on else config.THEME["text_muted"]
-        ir_lbl = "TAG IN POSITION" if ir_on else "WAITING FOR TAG"
-        pend_h = f'<div class="ir-pending">PENDING &nbsp; {pend} &nbsp; — awaiting IR</div>' if pend else ""
+**Arduino responses parsed by Python**
 
-        st.markdown(f"""
-<div class="ir-card {ir_cls2}">
-  <div class="ir-row">
-    <span class="ir-led {led_c}"></span>
-    <span class="ir-label" style="color:{ir_col};">{ir_lbl}</span>
-  </div>
-  <div class="ir-note">
-    Servo fires only when the IR sensor detects the belt tag.<br>
-    Arduino must send <code>{config.IR_TRIGGER_CHAR}</code> on detection.
-  </div>
-  {pend_h}
-</div>
-        """, unsafe_allow_html=True)
+| Response | Meaning |
+|---|---|
+| `READY` | Boot complete, conveyor on |
+| `ACK:OK` | 'O' received |
+| `ACK:DEFECT` | 'D' received |
+| `ACK:RESET` | 'R' received |
+| `IR:OK` | IR-OK sensor triggered, servoOK sweeping |
+| `IR:DEFECT` | IR-DEFECT sensor triggered, servoDEFECT sweeping |
+        """)
+    with hr2:
+        st.markdown("""
+**System Flow**
 
-    with ti2:
-        st.markdown(f"""
-**How it works**
-
-1. Camera detects a defect or good part continuously for **{st.session_state.confirm_time:.1f}s**
-2. State commits → servo command is queued (not sent yet)
-3. When the belt tag passes the IR sensor, Arduino sends `{config.IR_TRIGGER_CHAR}` over serial
-4. The queued command fires immediately — servo moves at exactly the right moment
-
-**Wiring**
-- IR sensor OUT → Arduino digital pin
-- Servo signal → Pin 9, 5V → Red, GND → Black
-- Close Arduino IDE Serial Monitor before connecting here
-
-**Serial test (Linux)**
-```bash
-ls /dev/ttyACM*
-sudo usermod -a -G dialout $USER
 ```
+Camera detects item on belt
+         |
+   Stable for 2s?
+   /           \\
+ YES            NO
+  |              |
+Send 'O'      Send 'D'     (stay IDLE)
+  |              |
+Arduino stops conveyor (4s)
+  |              |
+Item reaches   Item reaches
+IR-OK sensor   IR-DEFECT sensor
+  |              |
+servoOK        servoDEFECT
+sweeps 0->180  sweeps 0->180
+then returns   then returns
+  |              |
+Conveyor resumes
+```
+
+**Troubleshooting**
+
+- Close Arduino IDE Serial Monitor before connecting here
+- Linux: `ls /dev/ttyACM*`
+- Permissions: `sudo usermod -a -G dialout $USER`
+- IR sensors must output LOW on detection (standard NPN type)
+- If conveyor doesn't stop: check relay on pin 8, check relay logic (HIGH=ON in sketch)
+- Test manually: use the Manual Commands buttons above
         """)
 
 # ================================================================
 # SYSTEM STATUS BAR
 # ================================================================
+run_cls2 = "run"  if st.session_state.running    else "stop"
+ard_cls2 = "ok"   if st.session_state.connected  else "err"
+con_cls2 = "ok"   if st.session_state.conveyor_on else "warn"
+
 st.markdown(f"""
 <div class="sysbar">
-  <div class="sb-item {run_cls}">
+  <div class="sb-item {run_cls2}">
     <span class="sb-dot"></span>
     <span class="sb-text">{"RUNNING" if st.session_state.running else "STOPPED"}</span>
   </div>
   <span class="sb-sep">|</span>
-  <div class="sb-item {ard_cls}">
+  <div class="sb-item {ard_cls2}">
     <span class="sb-dot"></span>
     <span class="sb-text">{"ARDUINO" if st.session_state.connected else "NO ARDUINO"}</span>
   </div>
   <span class="sb-sep">|</span>
-  <div class="sb-item {ir_cls}">
+  <div class="sb-item {con_cls2}">
     <span class="sb-dot"></span>
-    <span class="sb-text">{"IR ACTIVE" if st.session_state.ir_triggered else "IR IDLE"}</span>
+    <span class="sb-text">{"CONVEYOR ON" if st.session_state.conveyor_on else "CONVEYOR OFF"}</span>
   </div>
   <span class="sb-sep">|</span>
   <div class="sb-item">
-    <span class="sb-text">{st.session_state.video_width}x{st.session_state.video_height} @ {st.session_state.fps_target}fps</span>
+    <span class="sb-text">
+      {st.session_state.video_width}x{st.session_state.video_height}
+      @ {st.session_state.fps_target}fps
+    </span>
   </div>
   <span class="sb-sep">|</span>
   <div class="sb-item">
-    <span class="sb-text">{model_path}  [{device.upper()}]</span>
+    <span class="sb-text">{st.session_state.model_path}  [{st.session_state.device.upper()}]</span>
   </div>
   <span class="sb-sep">|</span>
   <div class="sb-item">
-    <span class="sb-text">conf {st.session_state.conf:.2f}  iou {st.session_state.iou:.2f}  confirm {st.session_state.confirm_time:.1f}s</span>
+    <span class="sb-text">
+      conf {st.session_state.conf:.2f}
+      &nbsp; iou {st.session_state.iou:.2f}
+      &nbsp; confirm {st.session_state.confirm_time:.1f}s
+    </span>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
 # ================================================================
-# IDLE PLACEHOLDERS
+# IDLE STATE PLACEHOLDERS
 # ================================================================
 if not st.session_state.running:
     W = st.session_state.video_width
     H = min(st.session_state.video_height, 480)
 
     video_ph.markdown(f"""
-<div class="cam-idle" style="width:{W}px;height:{H}px;max-width:100%;">
-  <div class="ci-icon">📷</div>
+<div class="cam-idle" style="width:{W}px; height:{H}px; max-width:100%;">
+  <div class="ci-icon">&#128247;</div>
   <div class="ci-title">Detection Paused</div>
-  <div class="ci-sub">cam {st.session_state.camera_index} &nbsp;·&nbsp;
-    {W}x{st.session_state.video_height} &nbsp;·&nbsp; {st.session_state.fps_target}fps</div>
+  <div class="ci-sub">
+    cam {st.session_state.camera_index} &nbsp;·&nbsp;
+    {W}x{st.session_state.video_height} &nbsp;·&nbsp;
+    {st.session_state.fps_target} fps
+  </div>
 </div>""", unsafe_allow_html=True)
 
     status_ph.markdown("""
 <div class="status-card sc-idle">
   <div class="sc-eyebrow">System Output</div>
   <div style="margin-bottom:8px;">
-    <span class="pill pill-muted"><span class="dot"></span>IDLE</span>
-  </div>
-  <div class="sc-state" style="color:var(--t-muted);">IDLE</div>
-  <div class="sc-sub">Press START to begin</div>
-</div>""", unsafe_allow_html=True)
-
-    p2 = st.session_state.servo_pos
-    p2c = ((p2/180)*100)
-    pc2 = config.THEME["red"] if p2==0 else config.THEME["green"] if p2==90 else config.THEME["blue"]
-    servo_ph.markdown(f"""
-<div class="servo-card" style="margin-top:10px;">
-  <div class="sv-header">
-    <span class="sv-title">Servo</span>
-    <span style="font-family:var(--mono);font-size:10px;color:var(--t-muted);">IDLE</span>
-  </div>
-  <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px;">
-    <span class="sv-val" style="color:{pc2};">{p2}&deg;</span>
-    <span style="font-family:var(--mono);font-size:11px;color:var(--t-secondary);">
-      {"LEFT" if p2==0 else "CENTER" if p2==90 else "RIGHT"}
+    <span class="pill pill-muted">
+      <span class="dot"></span>IDLE
     </span>
   </div>
-  <div class="sv-track">
-    <div class="sv-thumb" style="left:calc({p2c:.1f}% - 8px);background:{pc2};color:{pc2};"></div>
-  </div>
-  <div class="sv-ticks"><span>0&deg;</span><span>90&deg;</span><span>180&deg;</span></div>
+  <div class="sc-state" style="color:var(--t-mute);">IDLE</div>
+  <div class="sc-sub">Press START to begin inspection</div>
 </div>""", unsafe_allow_html=True)
 
-    ir_ph.markdown(f"""
-<div class="ir-card" style="margin-top:10px;">
-  <div class="ir-row">
-    <span class="ir-led off"></span>
-    <span class="ir-label" style="color:var(--t-muted);">WAITING FOR TAG</span>
-  </div>
-  <div class="ir-note">Servo fires on IR trigger <code>{config.IR_TRIGGER_CHAR}</code></div>
-</div>""", unsafe_allow_html=True)
-
-    fps_ph.metric("FPS",    "—")
-    det_ph.metric("Det.",   "—")
-    cf_ph.metric("Conf.",  "—")
+    render_hw()
+    fps_ph.metric("FPS",   "--")
+    det_ph.metric("Det.",  "--")
+    cf_ph.metric("Conf.", "--")
 
 # ================================================================
-# MAIN PROCESSING LOOP
+# MAIN DETECTION LOOP
 # ================================================================
 if st.session_state.running and model:
     cap = cv2.VideoCapture(st.session_state.camera_index)
@@ -624,152 +750,140 @@ if st.session_state.running and model:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, st.session_state.video_height)
 
     if not cap.isOpened():
-        st.error("Failed to open camera — check the index in Camera settings.")
+        st.error("Failed to open camera — check Camera Index in settings.")
         st.session_state.running = False
     else:
         while st.session_state.running:
             t0 = time.time()
 
-            poll_ir()
+            # Poll Arduino for hardware state updates
+            poll_serial()
 
+            # Capture frame
             ret, frame = cap.read()
             if not ret:
-                st.warning("Frame capture failed.")
+                st.warning("Frame capture failed — camera may have disconnected.")
                 break
-            frame = cv2.resize(frame, (st.session_state.video_width, st.session_state.video_height))
 
+            frame = cv2.resize(
+                frame,
+                (st.session_state.video_width, st.session_state.video_height)
+            )
+
+            # Run inference
             results = model.predict(
                 frame,
                 conf=st.session_state.conf,
                 iou=st.session_state.iou,
-                device=device,
+                device=st.session_state.device,
                 verbose=False,
             )
             result = results[0]
 
+            # Parse detections
             dets = []
             if result.boxes:
                 for box in result.boxes:
-                    dets.append({"class_id": int(box.cls[0]),
-                                 "confidence": float(box.conf[0])})
+                    dets.append({
+                        "class_id":   int(box.cls[0]),
+                        "confidence": float(box.conf[0]),
+                    })
 
-            confirmed, is_new, info, prog = confirm(dets)
+            # Run confirmation state machine
+            confirmed, is_new, info, prog = check_confirm(dets)
 
-            # ── Video ──────────────────────────────────────────
-            ann = result.plot(boxes=True, labels=True, conf=True, line_width=2)
-            ann = cv2.cvtColor(ann, cv2.COLOR_BGR2RGB)
-            video_ph.image(ann, channels="RGB",
-                           use_container_width=False,
-                           width=st.session_state.video_width)
+            # Draw annotated frame
+            ann     = result.plot(boxes=True, labels=True, conf=True, line_width=2)
+            ann_rgb = cv2.cvtColor(ann, cv2.COLOR_BGR2RGB)
+            video_ph.image(
+                ann_rgb, channels="RGB",
+                use_container_width=False,
+                width=st.session_state.video_width
+            )
 
-            # ── Status Card ────────────────────────────────────
-            avg_c    = np.mean([d["confidence"] for d in dets]) if dets else 0.0
-            bar_pct  = prog * 100
-            cstate   = ("Confirming..." if 0 < prog < 1.0 and dets
-                        else "Stable" if confirmed != "IDLE" else "Idle")
+            # ── Status card ────────────────────────────────
+            avg_c   = np.mean([d["confidence"] for d in dets]) if dets else 0.0
+            bar_pct = prog * 100
+            c_state = (
+                "Confirming..." if 0 < prog < 1.0 and dets
+                else "Stable" if confirmed != "IDLE"
+                else "Idle"
+            )
+            sent_note = ""
+            if st.session_state.last_sent_cmd:
+                sent_note = (
+                    f'<div style="margin-top:8px;font-family:var(--mono);'
+                    f'font-size:10px;color:var(--t-sec);">'
+                    f'Last sent: &nbsp;<code style="color:var(--blue);">'
+                    f"'{st.session_state.last_sent_cmd}'"
+                    f'</code></div>'
+                )
 
             status_ph.markdown(f"""
 <div class="status-card {info['cls']}">
   <div class="sc-eyebrow">System Output</div>
   <div style="margin-bottom:8px;">
-    <span class="pill {info['badge']}"><span class="dot"></span>{info['label']}</span>
-  </div>
-  <div class="sc-state" style="color:{info['color']};">{confirmed}</div>
-  <div class="sc-sub">conf&nbsp;{avg_c:.2f} &nbsp;&bull;&nbsp; {len(dets)} obj</div>
-  <div class="cbar-wrap">
-    <div class="cbar-track">
-      <div class="cbar-fill" style="width:{bar_pct:.0f}%;background:{info['color']};"></div>
-    </div>
-    <div class="cbar-label">
-      <span>{cstate}</span><span>{bar_pct:.0f}%</span>
-    </div>
-  </div>
-</div>""", unsafe_allow_html=True)
-
-            # ── Servo ──────────────────────────────────────────
-            p     = st.session_state.servo_pos
-            pp    = (p / 180) * 100
-            pc    = config.THEME["red"]   if p==0  else \
-                    config.THEME["green"] if p==90 else \
-                    config.THEME["blue"]
-            pn    = "LEFT" if p==0 else "CENTER" if p==90 else "RIGHT"
-            pend  = st.session_state.pending_servo_cmd
-            ph2   = f'<div class="ir-pending">PENDING &nbsp;{pend}&nbsp; — awaiting IR</div>' if pend else ""
-            ir2   = st.session_state.ir_triggered
-            irl   = "TAG ACTIVE" if ir2 else "NO TAG"
-            irc   = config.THEME["orange"] if ir2 else config.THEME["text_muted"]
-
-            servo_ph.markdown(f"""
-<div class="servo-card" style="margin-top:10px;">
-  <div class="sv-header">
-    <span class="sv-title">Servo</span>
-    <span style="font-family:var(--mono);font-size:9px;color:{irc};">&bull; {irl}</span>
-  </div>
-  <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px;">
-    <span class="sv-val" style="color:{pc};">{p}&deg;</span>
-    <span style="font-family:var(--mono);font-size:11px;color:var(--t-secondary);">{pn}</span>
-  </div>
-  <div class="sv-track">
-    <div class="sv-thumb" style="left:calc({pp:.1f}% - 8px);background:{pc};color:{pc};"></div>
-  </div>
-  <div class="sv-ticks"><span>0&deg;</span><span>90&deg;</span><span>180&deg;</span></div>
-  {ph2}
-</div>""", unsafe_allow_html=True)
-
-            # ── IR ─────────────────────────────────────────────
-            ir_on2 = st.session_state.ir_triggered
-            ir_ph.markdown(f"""
-<div class="ir-card {"ir-hot" if ir_on2 else ""}" style="margin-top:10px;">
-  <div class="ir-row">
-    <span class="ir-led {"on" if ir_on2 else "off"}"></span>
-    <span class="ir-label" style="color:{config.THEME["orange"] if ir_on2 else config.THEME["text_muted"]};">
-      {"TAG IN POSITION" if ir_on2 else "WAITING FOR TAG"}
+    <span class="pill {info['badge']}">
+      <span class="dot"></span>{info['label']}
     </span>
   </div>
-  <div class="ir-note">Trigger char: <code>{config.IR_TRIGGER_CHAR}</code></div>
+  <div class="sc-state" style="color:{info['color']};">{confirmed}</div>
+  <div class="sc-sub">conf {avg_c:.2f} &nbsp;·&nbsp; {len(dets)} obj</div>
+  <div class="cbar-wrap">
+    <div class="cbar-track">
+      <div class="cbar-fill"
+           style="width:{bar_pct:.0f}%; background:{info['color']};"></div>
+    </div>
+    <div class="cbar-label">
+      <span>{c_state}</span><span>{bar_pct:.0f}%</span>
+    </div>
+  </div>
+  {sent_note}
 </div>""", unsafe_allow_html=True)
 
-            # ── Metrics ────────────────────────────────────────
+            # ── Hardware panel ─────────────────────────────
+            render_hw()
+
+            # ── Metrics ────────────────────────────────────
             fps = 1.0 / max(time.time() - t0, 1e-9)
             fps_ph.metric("FPS",   f"{fps:.1f}")
             det_ph.metric("Det.",  len(dets))
             cf_ph.metric("Conf.", f"{avg_c:.2f}")
 
-            # ── History ────────────────────────────────────────
+            # ── History table ──────────────────────────────
             if is_new or st.session_state.frame_count % 5 == 0:
+                action = (
+                    f"Sent '{info['cmd']}'" if is_new and info["cmd"]
+                    else confirmed
+                )
                 entry = {
                     "Time":       datetime.now().strftime("%H:%M:%S"),
                     "Status":     confirmed,
                     "Confidence": f"{avg_c:.2f}",
                     "Objects":    len(dets),
-                    "Cmd":        info["cmd"] or "---",
-                    "Angle":      info["angle"],
+                    "Sent":       info["cmd"] or "---",
+                    "Action":     action,
                 }
                 st.session_state.output_history.append(entry)
                 df = pd.DataFrame(list(st.session_state.output_history))
                 table_ph.dataframe(df.tail(15), use_container_width=True, height=220)
 
                 if is_new:
-                    key = {"DEFECT":"defect","NO_DEFECT":"no_defect",
-                           "IDLE":"idle"}.get(confirmed,"idle")
+                    key = {
+                        "DEFECT":    "defect",
+                        "NO_DEFECT": "no_defect",
+                        "IDLE":      "idle",
+                    }.get(confirmed, "idle")
                     st.session_state.stats[key]    += 1
                     st.session_state.stats["total"] += 1
 
-            # ── Stats ──────────────────────────────────────────
-            s2 = st.session_state.stats
-            stats_ph.markdown(f"""
-<div class="stats-grid">
-  <div class="sg-cell sg-total"><div class="sg-val">{s2['total']}</div><div class="sg-lbl">Total</div></div>
-  <div class="sg-cell sg-defect"><div class="sg-val">{s2['defect']}</div><div class="sg-lbl">Defect</div></div>
-  <div class="sg-cell sg-good"><div class="sg-val">{s2['no_defect']}</div><div class="sg-lbl">Good</div></div>
-  <div class="sg-cell sg-idle"><div class="sg-val">{s2['idle']}</div><div class="sg-lbl">Idle</div></div>
-</div>""", unsafe_allow_html=True)
-
+            render_stats()
             st.session_state.frame_count += 1
 
-            # ── FPS cap ────────────────────────────────────────
+            # FPS cap
             wait = (1.0 / st.session_state.fps_target) - (time.time() - t0)
-            if wait > 0: time.sleep(wait)
+            if wait > 0:
+                time.sleep(wait)
 
         cap.release()
 
@@ -778,10 +892,12 @@ if st.session_state.running and model:
 # ================================================================
 st.markdown(f"""
 <div class="footer">
-  LabelInspect &nbsp;&bull;&nbsp;
-  {model_path} &nbsp;&bull;&nbsp; {device.upper()} &nbsp;&bull;&nbsp;
-  {st.session_state.video_width}x{st.session_state.video_height} @ {st.session_state.fps_target}fps &nbsp;&bull;&nbsp;
-  {config.SERIAL_PORT} @ {config.SERIAL_BAUDRATE} &nbsp;&bull;&nbsp;
-  IR char: <code style="font-size:9px;">{config.IR_TRIGGER_CHAR}</code>
+  LabelInspect &nbsp;·&nbsp;
+  {st.session_state.model_path} &nbsp;·&nbsp;
+  {st.session_state.device.upper()} &nbsp;·&nbsp;
+  {st.session_state.video_width}x{st.session_state.video_height}
+  @ {st.session_state.fps_target}fps &nbsp;·&nbsp;
+  {st.session_state.serial_port} @ {st.session_state.baud} &nbsp;·&nbsp;
+  Protocol: <code style="font-size:9px;">'O' / 'D' / 'R'</code>
 </div>
 """, unsafe_allow_html=True)
